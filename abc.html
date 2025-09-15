@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Tenant SaaS Notes App</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {}
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useContext, createContext, useMemo } = React;
+
+        // --- MOCK UTILS & HELPERS ---
+        const simpleHash = async (password) => `hashed_${password}`;
+        const compareHash = async (password, hash) => `hashed_${password}` === hash;
+        const createMockJWT = (payload) => btoa(JSON.stringify(payload));
+        const decodeMockJWT = (token) => { try { return JSON.parse(atob(token)); } catch (e) { return null; } };
+
+        // --- MOCK DATABASE ---
+        const initialData = {
+            tenants: [{ id: 't1', name: 'Acme', slug: 'acme', plan: 'free' },{ id: 't2', name: 'Globex', slug: 'globex', plan: 'free' }],
+            users: [
+                { id: 'u1', name: 'Alice Admin', email: 'admin@acme.test', passwordHash: 'hashed_password', role: 'admin', tenantId: 't1' },
+                { id: 'u2', name: 'Bob Member', email: 'user@acme.test', passwordHash: 'hashed_password', role: 'member', tenantId: 't1' },
+                { id: 'u3', name: 'Charles Admin', email: 'admin@globex.test', passwordHash: 'hashed_password', role: 'admin', tenantId: 't2' },
+                { id: 'u4', name: 'Diana Member', email: 'user@globex.test', passwordHash: 'hashed_password', role: 'member', tenantId: 't2' },
+            ],
+            notes: [
+                { id: 'n1', title: 'Acme Initial Note', content: 'This is a note for <strong>Acme</strong>.', userId: 'u2', tenantId: 't1', tags: ['welcome'], isDeleted: false, isPinned: true, updatedAt: new Date(Date.now() - 86400000).toISOString() },
+                { id: 'n2', title: 'Globex Project Idea', content: 'Project Phoenix details.', userId: 'u4', tenantId: 't2', tags: ['project', 'urgent'], isDeleted: false, isPinned: false, updatedAt: new Date().toISOString() },
+                { id: 'n3', title: 'Q3 Marketing Plan', content: 'Review with the team.', userId: 'u1', tenantId: 't1', tags: ['marketing'], isDeleted: true, isPinned: false, updatedAt: new Date().toISOString() },
+                { id: 'n4', title: 'Welcome to Globex!', content: 'Your new note-taking app.', userId: 'u3', tenantId: 't2', tags: ['welcome'], isDeleted: false, isPinned: true, updatedAt: new Date(Date.now() - 172800000).toISOString() },
+            ],
+            auditLogs: [{ id: 'l1', tenantId: 't1', userId: 'u2', action: "Created note 'Acme Initial Note'", timestamp: new Date().toISOString() }]
+        };
+
+        const PRICING_PLANS = {
+            free: { name: 'Free', price: 0, noteLimit: 3, userLimit: 2 },
+            pro: { name: 'Pro', price: 15, noteLimit: Infinity, userLimit: 10 },
+            business: { name: 'Business', price: 50, noteLimit: Infinity, userLimit: Infinity },
+        };
+
+        // --- CONTEXT & PROVIDERS ---
+        const AuthContext = createContext(null);
+        const ApiContext = createContext(null);
+        const ThemeContext = createContext(null);
+
+        const ThemeProvider = ({ children }) => {
+            const [theme, setTheme] = useState(() => localStorage.getItem('saas_theme') || 'light');
+            useEffect(() => {
+                const root = window.document.documentElement;
+                root.classList.remove(theme === 'light' ? 'dark' : 'light');
+                root.classList.add(theme);
+                localStorage.setItem('saas_theme', theme);
+            }, [theme]);
+            const toggleTheme = () => setTheme(prevTheme => (prevTheme === 'light' ? 'dark' : 'light'));
+            return <ThemeContext.Provider value={{ theme, toggleTheme }}>{children}</ThemeContext.Provider>;
+        };
+
+        const AuthProvider = ({ children }) => {
+            const [token, setToken] = useState(() => localStorage.getItem('saas_token'));
+            const [user, setUser] = useState(null);
+            useEffect(() => {
+                const storedToken = localStorage.getItem('saas_token');
+                if (storedToken) {
+                    const decodedUser = decodeMockJWT(storedToken);
+                    if (decodedUser) { setUser(decodedUser); } 
+                    else { localStorage.removeItem('saas_token'); setToken(null); }
+                } else { setUser(null); }
+            }, [token]);
+            const login = (newToken) => { localStorage.setItem('saas_token', newToken); setToken(newToken); };
+            const logout = () => { localStorage.removeItem('saas_token'); setToken(null); };
+            const updateUserJwt = (updatedUserData) => {
+              const currentData = decodeMockJWT(token);
+              const newJwtData = { ...currentData, ...updatedUserData };
+              login(createMockJWT(newJwtData));
+            };
+            const authContextValue = useMemo(() => ({ token, user, login, logout, updateUserJwt }), [token, user]);
+            return <AuthContext.Provider value={authContextValue}>{children}</AuthContext.Provider>;
+        };
+
+        const ApiProvider = ({ children }) => {
+            const [db, setDb] = useState(JSON.parse(JSON.stringify(initialData)));
+            const { user } = useContext(AuthContext);
+
+            const getAuthenticatedUserAndTenant = () => {
+                if (!user) throw new Error('Not authorized.');
+                const tenant = db.tenants.find(t => t.id === user.tenantId);
+                if (!tenant) throw new Error('Tenant not found.');
+                const userDetails = db.users.find(u => u.id === user.id);
+                return { currentUser: userDetails, currentTenant: tenant };
+            };
+            
+            const logAction = (tenantId, userId, action) => {
+                const newLog = { id: `l${Date.now()}`, tenantId, userId, action, timestamp: new Date().toISOString() };
+                setDb(prev => ({ ...prev, auditLogs: [newLog, ...prev.auditLogs] }));
+            };
+
+            const api = {
+                login: async (email, password) => {
+                    const userInDb = db.users.find(u => u.email === email);
+                    if (!userInDb) throw new Error('Invalid credentials');
+                    if (!(await compareHash(password, userInDb.passwordHash))) throw new Error('Invalid credentials');
+                    const tenant = db.tenants.find(t => t.id === userInDb.tenantId);
+                    return createMockJWT({ id: userInDb.id, email: userInDb.email, name: userInDb.name, role: userInDb.role, tenantId: userInDb.tenantId, tenantSlug: tenant.slug });
+                },
+                getNotes: async ({ filterDeleted = false, tag = null, searchQuery = null }) => {
+                    const { currentUser } = getAuthenticatedUserAndTenant();
+                    await new Promise(res => setTimeout(res, 300)); // Simulate network delay
+                    let notes = db.notes.filter(n => n.tenantId === currentUser.tenantId && n.isDeleted === filterDeleted);
+                    if (tag) notes = notes.filter(n => n.tags.includes(tag));
+                    if (searchQuery) {
+                        const sq = searchQuery.toLowerCase();
+                        notes = notes.filter(n => n.title.toLowerCase().includes(sq) || n.content.toLowerCase().includes(sq));
+                    }
+                    return notes.sort((a, b) => b.isPinned - a.isPinned || new Date(b.updatedAt) - new Date(a.updatedAt));
+                },
+                createNote: async ({ title, content, tags }) => {
+                    const { currentUser, currentTenant } = getAuthenticatedUserAndTenant();
+                    const plan = PRICING_PLANS[currentTenant.plan];
+                    if (db.notes.filter(n => n.tenantId === currentUser.tenantId && !n.isDeleted).length >= plan.noteLimit) {
+                        throw new Error('Note limit reached. Please upgrade.');
+                    }
+                    const newNote = { id: `n${Date.now()}`, title, content, userId: currentUser.id, tenantId: currentUser.tenantId, tags: tags || [], isDeleted: false, isPinned: false, updatedAt: new Date().toISOString() };
+                    setDb(prev => ({ ...prev, notes: [...prev.notes, newNote] }));
+                    logAction(currentUser.tenantId, currentUser.id, `Created note: '${title}'`);
+                    return newNote;
+                },
+                updateNote: async (noteId, { title, content, tags, isPinned }) => {
+                    const { currentUser } = getAuthenticatedUserAndTenant();
+                    let noteToUpdate;
+                    setDb(prev => ({ ...prev, notes: prev.notes.map(n => {
+                        if (n.id === noteId && n.tenantId === currentUser.tenantId) {
+                            noteToUpdate = { ...n, title, content, tags, updatedAt: new Date().toISOString(), isPinned: isPinned !== undefined ? isPinned : n.isPinned };
+                            return noteToUpdate;
+                        }
+                        return n;
+                    })}));
+                    if (noteToUpdate) {
+                        logAction(currentUser.tenantId, currentUser.id, `Updated note: '${title}'`);
+                        return noteToUpdate;
+                    }
+                    throw new Error("Note not found or permission denied.");
+                },
+                deleteNote: async (noteId, permanent = false) => {
+                    const { currentUser } = getAuthenticatedUserAndTenant();
+                    const note = db.notes.find(n => n.id === noteId && n.tenantId === currentUser.tenantId);
+                    if (!note) throw new Error("Note not found.");
+                    if (permanent) {
+                        setDb(prev => ({ ...prev, notes: prev.notes.filter(n => n.id !== noteId) }));
+                        logAction(currentUser.tenantId, currentUser.id, `Permanently deleted note: '${note.title}'`);
+                    } else {
+                        setDb(prev => ({ ...prev, notes: prev.notes.map(n => n.id === noteId ? { ...n, isDeleted: true, isPinned: false } : n) }));
+                        logAction(currentUser.tenantId, currentUser.id, `Moved note to trash: '${note.title}'`);
+                    }
+                    return { message: "Success" };
+                },
+                emptyTrash: async () => {
+                     const { currentUser } = getAuthenticatedUserAndTenant();
+                     setDb(prev => ({...prev, notes: prev.notes.filter(n => n.tenantId !== currentUser.tenantId || !n.isDeleted)}));
+                     logAction(currentUser.tenantId, currentUser.id, `Emptied the trash`);
+                },
+                restoreNote: async (noteId) => {
+                    const { currentUser, currentTenant } = getAuthenticatedUserAndTenant();
+                    const plan = PRICING_PLANS[currentTenant.plan];
+                    if (db.notes.filter(n => n.tenantId === currentUser.tenantId && !n.isDeleted).length >= plan.noteLimit) throw new Error('Note limit reached. Cannot restore.');
+                    let restoredNote;
+                    setDb(prev => ({ ...prev, notes: prev.notes.map(n => {
+                        if (n.id === noteId && n.tenantId === currentUser.tenantId) {
+                            restoredNote = { ...n, isDeleted: false, updatedAt: new Date().toISOString() };
+                            return restoredNote;
+                        }
+                        return n;
+                    })}));
+                     if(restoredNote) logAction(currentUser.tenantId, currentUser.id, `Restored note: '${restoredNote.title}'`);
+                },
+                updateProfile: async ({ name, password }) => {
+                    const { currentUser } = getAuthenticatedUserAndTenant();
+                    let updatedUser;
+                    setDb(prev => ({...prev, users: prev.users.map(u => {
+                        if(u.id === currentUser.id) {
+                            updatedUser = {...u, name };
+                            if (password) updatedUser.passwordHash = `hashed_${password}`; // Simulate hashing
+                            return updatedUser;
+                        }
+                        return u;
+                    })}));
+                    logAction(currentUser.id, currentUser.id, "Updated profile information.");
+                    return { name: updatedUser.name, email: updatedUser.email };
+                },
+                getDashboardStats: async () => {
+                    const { currentUser, currentTenant } = getAuthenticatedUserAndTenant();
+                    const notes = db.notes.filter(n => n.tenantId === currentUser.tenantId && !n.isDeleted);
+                    const users = db.users.filter(u => u.tenantId === currentUser.tenantId);
+                    const recentNotes = notes.sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt)).slice(0, 3);
+                    return {
+                        noteCount: notes.length, userCount: users.length, plan: PRICING_PLANS[currentTenant.plan].name,
+                        noteLimit: PRICING_PLANS[currentTenant.plan].noteLimit, userLimit: PRICING_PLANS[currentTenant.plan].userLimit, recentNotes
+                    };
+                },
+                getUsersForTenant: async () => { const { currentUser } = getAuthenticatedUserAndTenant(); if (currentUser.role !== 'admin') throw new Error("Permission denied."); return db.users.filter(u => u.tenantId === currentUser.tenantId); },
+                inviteUser: async ({ email, role, name }) => {
+                    const { currentUser, currentTenant } = getAuthenticatedUserAndTenant();
+                    if (currentUser.role !== 'admin') throw new Error("Permission denied.");
+                    const plan = PRICING_PLANS[currentTenant.plan];
+                    if (db.users.filter(u => u.tenantId === currentUser.tenantId).length >= plan.userLimit) throw new Error(`User limit of ${plan.userLimit} reached for ${plan.name} plan.`);
+                    if (db.users.some(u => u.email === email)) throw new Error("Email already exists.");
+                    const newUser = { id: `u${Date.now()}`, name, email, passwordHash: 'hashed_temppassword', role, tenantId: currentUser.tenantId };
+                    setDb(prev => ({ ...prev, users: [...prev.users, newUser] }));
+                    logAction(currentUser.tenantId, currentUser.id, `Invited user: ${email} as ${role}`);
+                    return newUser;
+                },
+                upgradeTenant: async (newPlan) => {
+                    const { currentUser, currentTenant } = getAuthenticatedUserAndTenant();
+                    if (currentUser.role !== 'admin') throw new Error('Only admins can upgrade.');
+                    if (!PRICING_PLANS[newPlan]) throw new Error("Invalid plan selected.");
+                    setDb(prev => ({ ...prev, tenants: prev.tenants.map(t => t.id === currentTenant.id ? { ...t, plan: newPlan } : t) }));
+                    logAction(currentUser.tenantId, currentUser.id, `Upgraded subscription to ${PRICING_PLANS[newPlan].name} plan.`);
+                    return { message: `${currentTenant.name} has been upgraded.` };
+                },
+                getAuditLogs: async () => {
+                    const { currentUser } = getAuthenticatedUserAndTenant();
+                    if (currentUser.role !== 'admin') throw new Error("Permission denied.");
+                    const userNames = db.users.reduce((acc, u) => ({...acc, [u.id]: u.name}), {});
+                    return db.auditLogs.filter(l => l.tenantId === currentUser.tenantId).map(l => ({ ...l, userName: userNames[l.userId] || 'Unknown User' })).sort((a,b) => new Date(b.timestamp) - new Date(a.timestamp));
+                },
+            };
+            return <ApiContext.Provider value={api}>{children}</ApiContext.Provider>;
+        };
+
+        // --- UI COMPONENTS ---
+        const useApi = () => useContext(ApiContext);
+        const useTheme = () => useContext(ThemeContext);
+
+        const Spinner = () => <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500"></div>;
+        const Notification = ({ message, type, onDismiss }) => { if (!message) return null; const typeClasses = { error: "bg-red-500", success: "bg-green-500" }; return <div className="fixed top-5 right-5 z-50"><div className={`p-4 mb-4 rounded-lg shadow-lg text-white text-center ${typeClasses[type] || 'bg-gray-500'}`}>{message}<button onClick={onDismiss} className="ml-4 font-bold">X</button></div></div>; };
+
+        const ConfirmationModal = ({ isOpen, title, children, onConfirm, onCancel }) => {
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-0 bg-black bg-opacity-60 z-50 flex justify-center items-center">
+                    <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-xl w-full max-w-sm">
+                        <h2 className="text-xl font-bold mb-4 text-gray-900 dark:text-gray-100">{title}</h2>
+                        <div className="text-gray-700 dark:text-gray-300 mb-6">{children}</div>
+                        <div className="flex justify-end space-x-4">
+                            <button onClick={onCancel} className="px-4 py-2 bg-gray-200 dark:bg-gray-600 rounded hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                            <button onClick={onConfirm} className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700">Confirm</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const LoginPage = () => {
+            const [email, setEmail] = useState('admin@acme.test'); const [password, setPassword] = useState('password'); const [error, setError] = useState(''); const { login } = useContext(AuthContext); const api = useApi();
+            const handleSubmit = async (e) => { e.preventDefault(); setError(''); try { login(await api.login(email, password)); } catch (err) { setError(err.message); } };
+            return (<div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                <div className="max-w-md w-full bg-white dark:bg-gray-800 p-8 rounded-lg shadow-lg">
+                    <h2 className="text-2xl font-bold text-center mb-6 text-gray-900 dark:text-gray-100">Login to NotesSaaS</h2>
+                    {error && <p className="bg-red-100 text-red-700 p-3 rounded mb-4">{error}</p>}
+                    <form onSubmit={handleSubmit}>
+                        <div className="mb-4"><label className="block text-gray-700 dark:text-gray-300">Email</label><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded mt-1 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200" placeholder="e.g., admin@acme.test"/></div>
+                        <div className="mb-6"><label className="block text-gray-700 dark:text-gray-300">Password</label><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded mt-1 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-200" placeholder="password"/></div>
+                        <button type="submit" className="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700 transition duration-300">Login</button>
+                    </form>
+                    <div className="mt-4 text-sm text-gray-600 dark:text-gray-400 bg-gray-100 dark:bg-gray-700 p-3 rounded"><h4 className="font-bold text-gray-800 dark:text-gray-200">Test Accounts (password: `password`)</h4><ul className="list-disc list-inside mt-2"><li>admin@acme.test</li><li>user@acme.test</li><li>admin@globex.test</li><li>user@globex.test</li></ul></div>
+                </div>
+            </div>);
+        };
+
+        // --- LAYOUT ---
+        const AppLayout = ({ children, activePage }) => {
+            const { user, logout } = useContext(AuthContext);
+            const { theme, toggleTheme } = useTheme();
+            const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+            const tenantName = user?.tenantSlug.charAt(0).toUpperCase() + user?.tenantSlug.slice(1);
+            const NavLink = ({ page, label, icon }) => (
+                <a href={`#/${page}`} className={`w-full flex items-center text-left px-4 py-2 rounded-md transition-colors ${activePage === page ? 'bg-indigo-100 text-indigo-600 dark:bg-gray-700' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'}`}>
+                    <span className="mr-3">{icon}</span> {label}
+                </a>
+            );
+            return (
+                <div className="flex h-screen bg-gray-100 dark:bg-gray-900 text-gray-800 dark:text-gray-200">
+                     {isProfileModalOpen && <ProfileModal onClose={() => setIsProfileModalOpen(false)} />}
+                    <aside className="w-64 bg-white dark:bg-gray-800 shadow-md flex-shrink-0">
+                        <div className="p-4 text-2xl font-bold text-indigo-600 border-b border-gray-200 dark:border-gray-700">NotesSaaS</div>
+                        <nav className="p-4 space-y-2">
+                            <NavLink page="dashboard" label="Dashboard" icon="📊" />
+                            <NavLink page="notes" label="My Notes" icon="📝" />
+                            <NavLink page="trash" label="Trash" icon="🗑️" />
+                            {user?.role === 'admin' && <NavLink page="admin" label="Admin Panel" icon="⚙️" />}
+                            <NavLink page="billing" label="Billing" icon="💳" />
+                        </nav>
+                    </aside>
+                    <div className="flex-1 flex flex-col overflow-hidden">
+                        <header className="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700">
+                            <div className="px-6 py-3 flex justify-between items-center">
+                                <div className="text-xl font-semibold">Tenant: {tenantName}</div>
+                                <div className="flex items-center space-x-4">
+                                    <button onClick={toggleTheme} className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700">{theme === 'light' ? '🌙' : '☀️'}</button>
+                                    <button onClick={() => setIsProfileModalOpen(true)} className="font-medium text-gray-600 dark:text-gray-300 hover:text-indigo-600">{user.name} ({user.role})</button>
+                                    <button onClick={logout} className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition">Logout</button>
+                                </div>
+                            </div>
+                        </header>
+                        <main className="flex-1 overflow-x-hidden overflow-y-auto p-6">{children}</main>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- MODALS ---
+        const RichTextEditor = ({ value, onChange }) => {
+            const editorRef = React.useRef(null);
+            const applyStyle = (style) => {
+                editorRef.current.focus();
+                document.execCommand(style, false, null);
+            };
+            return (
+                <div className="border border-gray-300 dark:border-gray-600 rounded">
+                    <div className="flex items-center p-1 space-x-2 border-b border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-700">
+                        <button type="button" onClick={() => applyStyle('bold')} className="px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 font-bold">B</button>
+                        <button type="button" onClick={() => applyStyle('italic')} className="px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600 italic">I</button>
+                        <button type="button" onClick={() => applyStyle('insertUnorderedList')} className="px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-600">●</button>
+                    </div>
+                    <div
+                        ref={editorRef}
+                        contentEditable
+                        onInput={e => onChange(e.currentTarget.innerHTML)}
+                        className="w-full p-2 h-40 overflow-y-auto bg-white dark:bg-gray-700"
+                        dangerouslySetInnerHTML={{ __html: value }}
+                    />
+                </div>
+            );
+        };
+        const NoteModal = ({ note, onClose, onSave, showNotification }) => {
+            const [title, setTitle] = useState(''); const [content, setContent] = useState(''); const [tags, setTags] = useState('');
+            useEffect(() => {
+                if (note) { setTitle(note.title); setContent(note.content); setTags(note.tags.join(', ')); } 
+                else { setTitle(''); setContent(''); setTags(''); }
+            }, [note]);
+            const handleSubmit = (e) => {
+                e.preventDefault(); if(!title) { showNotification("Title is required.", "error"); return; }
+                const tagArray = tags.split(',').map(t => t.trim()).filter(Boolean);
+                onSave({ title, content, tags: tagArray });
+            };
+            return (
+                <div className="fixed inset-0 bg-black bg-opacity-60 z-40 flex justify-center items-center p-4">
+                    <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-xl w-full max-w-lg">
+                        <h2 className="text-xl font-bold mb-4">{note ? 'Edit Note' : 'Create Note'}</h2>
+                        <form onSubmit={handleSubmit}>
+                            <input type="text" placeholder="Note Title" value={title} onChange={e => setTitle(e.target.value)} className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded mb-4 bg-white dark:bg-gray-700"/>
+                            <RichTextEditor value={content} onChange={setContent} />
+                            <input type="text" placeholder="Tags (comma, separated)" value={tags} onChange={e => setTags(e.target.value)} className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded my-4 bg-white dark:bg-gray-700"/>
+                            <div className="flex justify-end space-x-4">
+                                <button type="button" onClick={onClose} className="px-4 py-2 bg-gray-200 dark:bg-gray-600 rounded hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                <button type="submit" className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">Save</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            );
+        };
+        const ProfileModal = ({ onClose }) => {
+            const { user, updateUserJwt } = useContext(AuthContext);
+            const api = useApi();
+            const [name, setName] = useState(user.name);
+            const [password, setPassword] = useState('');
+            const [confirmPassword, setConfirmPassword] = useState('');
+            const [notification, setNotification] = useState({});
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (password && password !== confirmPassword) { setNotification({ type: 'error', message: 'Passwords do not match.' }); return; }
+                try {
+                    const updatedUser = await api.updateProfile({ name, password: password || undefined });
+                    updateUserJwt({ name: updatedUser.name });
+                    setNotification({ type: 'success', message: 'Profile updated!' });
+                    setTimeout(onClose, 1000);
+                } catch (e) {
+                     setNotification({ type: 'error', message: e.message });
+                }
+            };
+
+            return (
+                <div className="fixed inset-0 bg-black bg-opacity-60 z-40 flex justify-center items-center p-4">
+                    <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-xl w-full max-w-md">
+                        <h2 className="text-xl font-bold mb-4">Edit Profile</h2>
+                        {notification.message && <div className={`p-2 mb-4 rounded text-white ${notification.type === 'error' ? 'bg-red-500' : 'bg-green-500'}`}>{notification.message}</div>}
+                        <form onSubmit={handleSubmit} className="space-y-4">
+                             <div><label>Name</label><input type="text" value={name} onChange={e => setName(e.target.value)} className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded mt-1 bg-white dark:bg-gray-700"/></div>
+                             <div><label>New Password</label><input type="password" value={password} onChange={e => setPassword(e.target.value)} className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded mt-1 bg-white dark:bg-gray-700"/></div>
+                             <div><label>Confirm New Password</label><input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded mt-1 bg-white dark:bg-gray-700"/></div>
+                            <div className="flex justify-end space-x-4 pt-4">
+                                <button type="button" onClick={onClose} className="px-4 py-2 bg-gray-200 dark:bg-gray-600 rounded hover:bg-gray-300 dark:hover:bg-gray-500">Cancel</button>
+                                <button type="submit" className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">Save Changes</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            );
+        };
+
+
+        // --- PAGES ---
+        const DashboardPage = ({ showNotification, setPage }) => {
+            const api = useApi();
+            const [stats, setStats] = useState(null);
+            const [loading, setLoading] = useState(true);
+            
+            useEffect(() => {
+                api.getDashboardStats().then(data => { setStats(data); setLoading(false); }).catch(e => { showNotification(e.message, 'error'); setLoading(false); });
+            }, []);
+            
+            const StatCard = ({ title, value, limit }) => (
+                <div className="bg-white dark:bg-gray-800 p-4 rounded-lg shadow"><h3 className="text-sm font-medium text-gray-500 dark:text-gray-400">{title}</h3><p className="text-2xl font-semibold">{value} {limit !== undefined && `/ ${limit}`}</p></div>
+            );
+            if (loading) return <div className="flex justify-center items-center h-full"><Spinner /></div>;
+            return (
+                <div>
+                    <h1 className="text-2xl font-bold mb-4">Dashboard</h1>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <StatCard title="Active Notes" value={stats?.noteCount} limit={stats?.noteLimit === Infinity ? '∞' : stats?.noteLimit} />
+                        <StatCard title="Team Members" value={stats?.userCount} limit={stats?.userLimit === Infinity ? '∞' : stats?.userLimit} />
+                        <StatCard title="Current Plan" value={stats?.plan} />
+                    </div>
+                    <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow">
+                      <h2 className="text-xl font-bold mb-4">Recent Notes</h2>
+                      {stats?.recentNotes.length > 0 ? (
+                        <ul className="space-y-2">
+                          {stats.recentNotes.map(note => <li key={note.id} className="p-2 bg-gray-50 dark:bg-gray-700 rounded"><a href="#/notes" onClick={() => setPage('notes')} className="font-medium text-indigo-600 dark:text-indigo-400 hover:underline">{note.title}</a></li>)}
+                        </ul>
+                      ) : <p>No recent notes.</p>}
+                    </div>
+                </div>
+            );
+        };
+        const NotesPage = ({ showNotification }) => {
+            const api = useApi();
+            const [notes, setNotes] = useState([]); const [loading, setLoading] = useState(true);
+            const [editingNote, setEditingNote] = useState(null); const [isModalOpen, setIsModalOpen] = useState(false);
+            const [search, setSearch] = useState(""); const [activeTag, setActiveTag] = useState(null);
+
+            const fetchData = async () => {
+                setLoading(true);
+                try { setNotes(await api.getNotes({ searchQuery: search, tag: activeTag })); } 
+                catch (e) { showNotification(e.message, 'error'); } 
+                finally { setLoading(false); }
+            };
+            
+            useEffect(() => { const handler = setTimeout(() => fetchData(), 300); return () => clearTimeout(handler); }, [search, activeTag]);
+
+            const handleSaveNote = async (noteData) => {
+                try {
+                    if (editingNote) { await api.updateNote(editingNote.id, { ...editingNote, ...noteData }); showNotification("Note updated!", "success"); } 
+                    else { await api.createNote(noteData); showNotification("Note created!", "success"); }
+                    setIsModalOpen(false); setEditingNote(null); fetchData();
+                } catch (e) { showNotification(e.message, 'error'); }
+            };
+            
+            const handleDelete = async (noteId) => { if(window.confirm("Move this note to trash?")) { try { await api.deleteNote(noteId); showNotification("Note moved to trash.", "success"); fetchData(); } catch (e) { showNotification(e.message, 'error'); } } };
+            const handlePinToggle = async (note) => {
+              try {
+                await api.updateNote(note.id, { ...note, isPinned: !note.isPinned });
+                showNotification(note.isPinned ? "Note unpinned" : "Note pinned", "success");
+                fetchData();
+              } catch (e) { showNotification(e.message, 'error'); }
+            };
+
+            return (
+                <div>
+                    {isModalOpen && <NoteModal note={editingNote} onClose={() => setIsModalOpen(false)} onSave={handleSaveNote} showNotification={showNotification}/>}
+                    <div className="flex justify-between items-center mb-4">
+                        <h1 className="text-2xl font-bold">My Notes {activeTag && <span className="text-lg font-normal text-gray-500">/ #{activeTag}</span>}</h1>
+                        <div>
+                          {activeTag && <button onClick={() => setActiveTag(null)} className="mr-4 text-sm text-red-500">Clear Filter</button>}
+                          <button onClick={() => { setEditingNote(null); setIsModalOpen(true); }} className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">Create Note</button>
+                        </div>
+                    </div>
+                    <input type="text" placeholder="Search notes..." value={search} onChange={e => setSearch(e.target.value)} className="w-full p-2 border rounded mb-4 bg-white dark:bg-gray-700 border-gray-300 dark:border-gray-600" />
+                    
+                    {loading ? <div className="flex justify-center items-center h-64"><Spinner/></div> :
+                    <div className="space-y-4">
+                        {notes.length > 0 ? notes.map(note => (
+                            <div key={note.id} className={`bg-white dark:bg-gray-800 p-4 rounded-lg shadow ${note.isPinned ? 'border-l-4 border-yellow-400' : ''}`}>
+                                <div className="flex justify-between items-start">
+                                    <h3 className="font-bold text-lg">{note.title}</h3>
+                                    <div className="flex items-center space-x-3">
+                                        <button onClick={() => handlePinToggle(note)} title={note.isPinned ? "Unpin Note" : "Pin Note"}>{note.isPinned ? '📌' : '📍'}</button>
+                                        <button onClick={() => { setEditingNote(note); setIsModalOpen(true); }} className="text-sm text-blue-500 hover:underline">Edit</button>
+                                        <button onClick={() => handleDelete(note.id)} className="text-sm text-red-500 hover:underline">Trash</button>
+                                    </div>
+                                </div>
+                                <div className="text-gray-700 dark:text-gray-300 mt-2" dangerouslySetInnerHTML={{ __html: note.content }} />
+                                <div className="mt-2">
+                                    {note.tags.map(tag => <button onClick={() => setActiveTag(tag)} key={tag} className="text-xs bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 px-2 py-1 rounded-full mr-1 hover:bg-gray-300">{tag}</button>)}
+                                </div>
+                            </div>
+                        )) : <p className="text-center text-gray-500 py-8">No notes found.</p>}
+                    </div>}
+                </div>
+            );
+        };
+        const AdminPage = ({ showNotification }) => {
+            const api = useApi(); const [users, setUsers] = useState([]); const [logs, setLogs] = useState([]); const fetchData = async () => { try { const [usersData, logsData] = await Promise.all([api.getUsersForTenant(), api.getAuditLogs()]); setUsers(usersData); setLogs(logsData); } catch(e) { showNotification(e.message, 'error'); } }; useEffect(() => { fetchData() }, []);
+            const handleInvite = async (e) => { e.preventDefault(); const { name, email, role } = e.target.elements; try { await api.inviteUser({ name: name.value, email: email.value, role: role.value }); showNotification('User invited successfully!', 'success'); e.target.reset(); fetchData(); } catch (e) { showNotification(e.message, 'error'); } };
+            return (<div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow"><h2 className="text-xl font-bold mb-4">User Management</h2><ul className="space-y-2 mb-6">{users.map(u => <li key={u.id} className="flex justify-between p-2 bg-gray-50 dark:bg-gray-700 rounded"><span>{u.name} ({u.email})</span><span className="font-mono text-sm bg-gray-200 dark:bg-gray-600 px-2 rounded">{u.role}</span></li>)}</ul><form onSubmit={handleInvite} className="border-t dark:border-gray-700 pt-4"><h3 className="font-semibold mb-2">Invite New User</h3><div className="grid grid-cols-1 md:grid-cols-2 gap-2"><input name="name" placeholder="Full Name" className="p-2 border rounded w-full bg-white dark:bg-gray-700 border-gray-300 dark:border-gray-600" required/><input name="email" type="email" placeholder="Email" className="p-2 border rounded w-full bg-white dark:bg-gray-700 border-gray-300 dark:border-gray-600" required/><select name="role" className="p-2 border rounded w-full bg-white dark:bg-gray-700 border-gray-300 dark:border-gray-600"><option value="member">Member</option><option value="admin">Admin</option></select><button type="submit" className="bg-indigo-500 text-white rounded p-2 hover:bg-indigo-600">Invite</button></div></form></div>
+                <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow"><h2 className="text-xl font-bold mb-4">Audit Log</h2><div className="space-y-2 max-h-96 overflow-y-auto">{logs.map(log => (<div key={log.id} className="text-sm p-2 bg-gray-50 dark:bg-gray-700 rounded"><p><span className="font-semibold">{log.userName}</span>: {log.action}</p><p className="text-xs text-gray-500 dark:text-gray-400">{new Date(log.timestamp).toLocaleString()}</p></div>))}</div></div>
+            </div>);
+        };
+        const BillingPage = ({ showNotification }) => {
+            const api = useApi();
+            const handlePurchase = async (planKey) => { showNotification("Processing payment...", "success"); try { await new Promise(resolve => setTimeout(resolve, 1500)); await api.upgradeTenant(planKey); showNotification("Upgrade successful! Your plan is now " + PRICING_PLANS[planKey].name, "success"); } catch (e) { showNotification(e.message, 'error'); } };
+            return (<div><h1 className="text-2xl font-bold mb-4">Choose Your Plan</h1><div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-center">{Object.entries(PRICING_PLANS).map(([key, plan]) => (<div key={key} className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-lg transform hover:scale-105 transition-transform"><h2 className="text-2xl font-bold text-indigo-600 dark:text-indigo-400">{plan.name}</h2><p className="text-4xl font-extrabold my-4">${plan.price}<span className="text-base font-medium">/mo</span></p><ul className="space-y-2 text-gray-600 dark:text-gray-300"><li>{plan.noteLimit === Infinity ? 'Unlimited' : plan.noteLimit} Notes</li><li>{plan.userLimit === Infinity ? 'Unlimited' : plan.userLimit} Users</li><li>{key === 'free' ? 'Basic' : 'Priority'} Support</li></ul><button onClick={() => handlePurchase(key)} className="mt-6 w-full bg-green-500 text-white py-2 rounded-lg font-semibold hover:bg-green-600 transition-colors">{key === 'free' ? 'Current Plan' : `Upgrade to ${plan.name}`}</button></div>))}</div></div>);
+        };
+        const TrashPage = ({ showNotification }) => {
+            const api = useApi(); const [deletedNotes, setDeletedNotes] = useState([]); const [loading, setLoading] = useState(true);
+            const [confirmAction, setConfirmAction] = useState(null);
+            const fetchData = async () => { setLoading(true); try { setDeletedNotes(await api.getNotes({ filterDeleted: true })); } catch (e) { showNotification(e.message, 'error'); } finally { setLoading(false); } };
+            useEffect(() => { fetchData(); }, []);
+            const handleRestore = async (noteId) => { try { await api.restoreNote(noteId); showNotification("Note restored!", "success"); fetchData(); } catch(e) { showNotification(e.message, 'error'); } };
+            const onConfirm = () => { if (confirmAction) { confirmAction(); setConfirmAction(null); }};
+
+            const handleDeletePermanent = (noteId) => { setConfirmAction(() => async () => { try { await api.deleteNote(noteId, true); showNotification("Note permanently deleted.", "success"); fetchData(); } catch (e) { showNotification(e.message, 'error'); } }); };
+            const handleEmptyTrash = () => { setConfirmAction(() => async () => { try { await api.emptyTrash(); showNotification("Trash emptied.", "success"); fetchData(); } catch(e) { showNotification(e.message, 'error'); } }); };
+            
+            return (
+                <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow">
+                    <ConfirmationModal isOpen={!!confirmAction} title="Are you sure?" onCancel={() => setConfirmAction(null)} onConfirm={onConfirm}>
+                        <p>This action is irreversible. The note(s) will be deleted forever.</p>
+                    </ConfirmationModal>
+                    <div className="flex justify-between items-center mb-4"><h1 className="text-2xl font-bold">Trash</h1>{deletedNotes.length > 0 && <button onClick={handleEmptyTrash} className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-700">Empty Trash</button>}</div>
+                    {loading ? <div className="flex justify-center py-8"><Spinner/></div> :
+                    <div className="space-y-3">
+                        {deletedNotes.length > 0 ? deletedNotes.map(note => (
+                            <div key={note.id} className="flex justify-between items-center p-3 bg-gray-100 dark:bg-gray-700 rounded">
+                                <span className="line-through text-gray-600 dark:text-gray-400">{note.title}</span>
+                                <div className="space-x-3">
+                                    <button onClick={() => handleRestore(note.id)} className="text-sm font-medium text-green-600 hover:underline">Restore</button>
+                                    <button onClick={() => handleDeletePermanent(note.id)} className="text-sm font-medium text-red-600 hover:underline">Delete Forever</button>
+                                </div>
+                            </div>
+                        )) : <p className="text-center text-gray-500 py-4">Trash is empty.</p>}
+                    </div>}
+                </div>
+            );
+        };
+
+        // --- APP ENTRY POINT ---
+        const AppContent = () => {
+            const { user } = useContext(AuthContext);
+            const [page, setPage] = useState(window.location.hash.replace('#/', '') || 'dashboard');
+            const [notification, setNotification] = useState({ message: '', type: '' });
+            
+            useEffect(() => {
+                const handleHashChange = () => setPage(window.location.hash.replace('#/', '') || 'dashboard');
+                window.addEventListener('hashchange', handleHashChange);
+                return () => window.removeEventListener('hashchange', handleHashChange);
+            }, []);
+
+            const showNotification = (message, type) => { setNotification({ message, type }); setTimeout(() => setNotification({ message: '', type: '' }), 4000); };
+            if (!user) { return <LoginPage />; }
+
+            const renderPage = () => {
+                switch (page) {
+                    case 'dashboard': return <DashboardPage showNotification={showNotification} setPage={setPage} />;
+                    case 'notes': return <NotesPage showNotification={showNotification} />;
+                    case 'admin': return <AdminPage showNotification={showNotification} />;
+                    case 'billing': return <BillingPage showNotification={showNotification} />;
+                    case 'trash': return <TrashPage showNotification={showNotification} />;
+                    default: window.location.hash = '/dashboard'; return null;
+                }
+            };
+            
+            return (
+                <React.Fragment>
+                    <Notification message={notification.message} type={notification.type} onDismiss={() => setNotification({ message: '', type: '' })} />
+                    <AppLayout activePage={page}>{renderPage()}</AppLayout>
+                </React.Fragment>
+            );
+        };
+
+        const App = () => (
+            <ThemeProvider>
+                <AuthProvider>
+                    <ApiProvider>
+                        <AppContent />
+                    </ApiProvider>
+                </AuthProvider>
+            </ThemeProvider>
+        );
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+
+    </script>
+</body>
+</html>
+
